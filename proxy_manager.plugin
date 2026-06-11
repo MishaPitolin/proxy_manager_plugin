@@ -38,9 +38,9 @@ from ui.settings import Header, Switch, Input, Selector, Text, Divider
 #  КОНСТАНТЫ
 # ═══════════════════════════════════════════════════════════════════
 
-PLUGIN_VERSION    = "6.1.0"
-UPDATE_CHECK_URL  = "https://github.com/MishaPitolin/proxy_manager_plugin/blob/main/version.json"
-UPDATE_PLUGIN_URL = "https://github.com/MishaPitolin/proxy_manager_plugin/blob/main/proxy_manager.plugin"
+PLUGIN_VERSION    = "6.1.1"
+UPDATE_CHECK_URL  = "https://raw.githubusercontent.com/MishaPitolin/proxy_manager_plugin/main/version.json"
+UPDATE_PLUGIN_URL = "https://raw.githubusercontent.com/MishaPitolin/proxy_manager_plugin/main/proxy_manager.plugin"
 
 DEFAULT_CHANNELS = (
     "TProxyRU,ProxyMTProto,ProxyFree_Ru,mtprx,MTProtoProxies,"
