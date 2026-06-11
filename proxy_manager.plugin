@@ -5,8 +5,8 @@ __description__ = (
     "хэндшейк, анти-DPI инспектор, гео-флаги, импорт/экспорт, блэклист, кэш, "
     "ручной режим, авто-переключение по пингу."
 )
-__author__ = "@your_username"
-__version__ = "6.1.0"
+__author__ = "@Shel_Meow"
+__version__ = "6.1.1"
 __min_version__ = "12.1.1"
 
 import base64, hashlib, hmac, json, os, re, socket, struct, threading, time
