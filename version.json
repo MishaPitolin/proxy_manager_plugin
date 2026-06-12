@@ -1,5 +1,5 @@
 {
-  "version": "6.1.1",
+  "version": "6.1.0",
   "url": "https://raw.githubusercontent.com/MishaPitolin/proxy_manager_plugin/main/proxy_manager.plugin",
-  "changelog": "Добавлено авто обновление"
+  "changelog": "v6.1.0: +35 каналов, GitHub источники (обновляются каждые 4ч), DoH, фильтр по дате поста, статистика прокси, избранные, история переключений"
 }

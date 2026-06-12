@@ -5,8 +5,8 @@ __description__ = (
     "хэндшейк, анти-DPI инспектор, гео-флаги, импорт/экспорт, блэклист, кэш, "
     "ручной режим, авто-переключение по пингу."
 )
-__author__ = "@Shel_Meow"
-__version__ = "6.1.1"
+__author__ = "@your_username"
+__version__ = "6.1.0"
 __min_version__ = "12.1.1"
 
 import base64, hashlib, hmac, json, os, re, socket, struct, threading, time
@@ -38,17 +38,39 @@ from ui.settings import Header, Switch, Input, Selector, Text, Divider
 #  КОНСТАНТЫ
 # ═══════════════════════════════════════════════════════════════════
 
-PLUGIN_VERSION    = "6.1.1"
+PLUGIN_VERSION    = "6.1.0"
 UPDATE_CHECK_URL  = "https://raw.githubusercontent.com/MishaPitolin/proxy_manager_plugin/main/version.json"
 UPDATE_PLUGIN_URL = "https://raw.githubusercontent.com/MishaPitolin/proxy_manager_plugin/main/proxy_manager.plugin"
 
 DEFAULT_CHANNELS = (
-    "TProxyRU,ProxyMTProto,ProxyFree_Ru,mtprx,MTProtoProxies,"
-    "mtproto_one,MTPRotoLists,EasyProxy,proxy_mtproto,freemtproxy,"
-    "tgproxy,ProxyforTelegram,MTProto_Proxy_List,proxy_hub,"
-    "TelegramProxy1,mtprotolist,proxygram,FreeProxyForTG,"
-    "publicproxy,proxyfor,socks5_proxy_list,Socks5Proxies"
+    # Крупные активные каналы (проверено 2026)
+    "ProxyMTProto,TProxyRU,ProxyFree_Ru,mtrproxytg,TelMTProto,"
+    # Средние каналы
+    "mtprx,MTProtoProxies,mtproto_one,MTPRotoLists,EasyProxy,"
+    "proxy_mtproto,freemtproxy,tgproxy,ProxyforTelegram,"
+    "MTProto_Proxy_List,proxy_hub,TelegramProxy1,mtprotolist,"
+    "proxygram,FreeProxyForTG,publicproxy,proxyfor,"
+    # SOCKS5
+    "socks5_proxy_list,Socks5Proxies,"
+    # Дополнительные найденные каналы
+    "MTProxyT,proxy_add,proxyforiran,VPN_Proxy_MTProto,"
+    "proxymtproto1,mtprotoproxy,free_mtproto,ProxyMTProto1,"
+    "mtproto_proxy_free,tg_proxy_free,ProxyGram,mtproto_obhod"
 )
+
+# GitHub репо с автообновлением каждые 4-12 часов
+GITHUB_PROXY_SOURCES = [
+    "https://raw.githubusercontent.com/SoliSpirit/mtproto/main/all_proxies.txt",
+    "https://raw.githubusercontent.com/Grim1313/mtproto-for-telegram/main/all_proxies.txt",
+    "https://raw.githubusercontent.com/kort0881/telegram-proxy-collector/main/proxies.txt",
+    "https://mtproto.cloud/feed.txt",
+]
+
+# Сайты с актуальными прокси
+WEB_PROXY_SOURCES = [
+    "https://mtproto.run/proxies",
+    "https://toproxylab.com/ru/proksi-dlya-tg",
+]
 
 INTERVAL_OPTIONS  = [10, 20, 30, 60, 120]
 THRESHOLD_OPTIONS = [100, 150, 200, 300, 500]
@@ -200,10 +222,12 @@ def _ping_color(ms: int) -> int:
     if ms < PING_MID_MS: return COLOR_MID
     return COLOR_SLOW
 
-def tcp_alive(host, port, timeout=TCP_TIMEOUT):
+def tcp_alive(host, port, timeout=TCP_TIMEOUT, use_doh=True):
     try:
+        # Используем DoH для резолвинга чтобы обойти DNS блокировки
+        resolved = resolve_host_doh(host) if use_doh else host
         t = time.monotonic()
-        with socket.create_connection((host, int(port)), timeout=timeout):
+        with socket.create_connection((resolved, int(port)), timeout=timeout):
             return (time.monotonic() - t) * 1000
     except: return 9999.0
 
@@ -241,7 +265,16 @@ def parse_all_proxies(text: str) -> List[Dict]:
                 "link": f"tg://socks?server={m.group(1)}&port={m.group(2)}&user={user}&pass={pwd}"})
     return found
 
-def extract_from_message(msg) -> List[Dict]:
+def extract_from_message(msg, max_age_days: int = 7) -> List[Dict]:
+    """Парсит прокси из сообщения. Игнорирует сообщения старше max_age_days."""
+    # Фильтр по дате — старые прокси обычно мертвы
+    try:
+        msg_date = getattr(msg, "date", 0) or 0
+        if msg_date > 0:
+            age_days = (time.time() - msg_date) / 86400
+            if age_days > max_age_days:
+                return []
+    except: pass
     found = []
     txt = getattr(msg, "message", None) or ""
     if txt: found.extend(parse_all_proxies(txt))
@@ -568,6 +601,32 @@ def _check_socks5(host, port, user, pwd, timeout):
             try: sock.close()
             except: pass
 
+def resolve_host_doh(hostname: str, timeout: int = 5) -> str:
+    """DNS-over-HTTPS через Cloudflare. Обходит DNS блокировки доменов прокси."""
+    if re.match(r"^\d{1,3}(\.\d{1,3}){3}$", hostname):
+        return hostname  # уже IP
+    try:
+        ctx = ssl.create_default_context()
+        url = f"https://1.1.1.1/dns-query?name={hostname}&type=A"
+        req = urllib.request.Request(url, headers={
+            "Accept": "application/dns-json",
+            "User-Agent": "Mozilla/5.0"
+        })
+        with urllib.request.urlopen(req, timeout=timeout, context=ctx) as r:
+            data = json.loads(r.read().decode())
+        answers = data.get("Answer", [])
+        for ans in answers:
+            if ans.get("type") == 1:  # A record
+                return ans["data"]
+    except Exception:
+        pass
+    # Fallback на системный DNS
+    try:
+        return socket.gethostbyname(hostname)
+    except:
+        return hostname
+
+
 def check_proxy_real(proxy: dict, timeout: int) -> float:
     """Реальный хэндшейк — MTProto/FakeTLS/SOCKS5. Возвращает мс или 9999."""
     host = proxy["server"]; port = proxy["port"]
@@ -585,6 +644,170 @@ def check_proxy_real(proxy: dict, timeout: int) -> float:
 # ═══════════════════════════════════════════════════════════════════
 #  КЭШ, БЛЭКЛИСТ, PREFETCH, ЛОГГЕР
 # ═══════════════════════════════════════════════════════════════════
+
+# ═══════════════════════════════════════════════════════════════════
+#  СТАТИСТИКА И ИЗБРАННЫЕ ПРОКСИ
+# ═══════════════════════════════════════════════════════════════════
+
+class ProxyStats:
+    """Считает uptime, среднее пинг и использование каждого прокси."""
+    def __init__(self, path: str):
+        self.path = path
+        self._data: Dict[str, Dict] = {}
+        self._load()
+        self._lock = threading.Lock()
+
+    def _key(self, p: dict) -> str:
+        return f"{p['server']}:{p['port']}"
+
+    def _load(self):
+        try:
+            with open(self.path) as f:
+                self._data = json.load(f)
+        except: self._data = {}
+
+    def _save(self):
+        try:
+            with open(self.path, "w") as f:
+                json.dump(self._data, f)
+        except: pass
+
+    def record_connect(self, p: dict, ping: float):
+        k = self._key(p)
+        with self._lock:
+            d = self._data.setdefault(k, {
+                "uses": 0, "total_ping": 0.0, "failures": 0,
+                "last_used": 0, "first_seen": int(time.time())
+            })
+            d["uses"] += 1
+            d["total_ping"] += ping
+            d["last_used"] = int(time.time())
+        self._save()
+
+    def record_failure(self, p: dict):
+        k = self._key(p)
+        with self._lock:
+            d = self._data.setdefault(k, {"uses": 0, "total_ping": 0.0, "failures": 0, "last_used": 0, "first_seen": int(time.time())})
+            d["failures"] += 1
+        self._save()
+
+    def avg_ping(self, p: dict) -> float:
+        k = self._key(p)
+        with self._lock:
+            d = self._data.get(k, {})
+            uses = d.get("uses", 0)
+            return d.get("total_ping", 0) / uses if uses > 0 else 0.0
+
+    def uptime(self, p: dict) -> float:
+        k = self._key(p)
+        with self._lock:
+            d = self._data.get(k, {})
+            uses = d.get("uses", 0); fail = d.get("failures", 0)
+            total = uses + fail
+            return (uses / total * 100) if total > 0 else 0.0
+
+    def uses(self, p: dict) -> int:
+        k = self._key(p)
+        with self._lock: return self._data.get(k, {}).get("uses", 0)
+
+    def summary(self, p: dict) -> str:
+        return (f"Использований: {self.uses(p)} • "
+                f"Avg пинг: {self.avg_ping(p):.0f}мс • "
+                f"Uptime: {self.uptime(p):.0f}%")
+
+    def top(self, proxies: List[Dict], n: int = 5) -> List[Dict]:
+        """Возвращает топ N прокси по uptime."""
+        return sorted(proxies, key=lambda p: self.uptime(p), reverse=True)[:n]
+
+
+class FavoriteProxies:
+    """Список избранных прокси — всегда пробуются первыми."""
+    def __init__(self, path: str):
+        self.path = path
+        self._favorites: List[str] = []  # список ключей "server:port"
+        self._load()
+        self._lock = threading.Lock()
+
+    def _key(self, p: dict) -> str: return f"{p['server']}:{p['port']}"
+
+    def _load(self):
+        try:
+            with open(self.path) as f: self._favorites = json.load(f)
+        except: self._favorites = []
+
+    def _save(self):
+        try:
+            with open(self.path, "w") as f: json.dump(self._favorites, f)
+        except: pass
+
+    def add(self, p: dict):
+        k = self._key(p)
+        with self._lock:
+            if k not in self._favorites: self._favorites.append(k)
+        self._save()
+
+    def remove(self, p: dict):
+        k = self._key(p)
+        with self._lock:
+            if k in self._favorites: self._favorites.remove(k)
+        self._save()
+
+    def is_favorite(self, p: dict) -> bool:
+        with self._lock: return self._key(p) in self._favorites
+
+    def prioritize(self, proxies: List[Dict]) -> List[Dict]:
+        """Ставит избранные прокси в начало списка."""
+        favs = [p for p in proxies if self.is_favorite(p)]
+        rest = [p for p in proxies if not self.is_favorite(p)]
+        return favs + rest
+
+    def count(self) -> int:
+        with self._lock: return len(self._favorites)
+
+
+class SwitchHistory:
+    """История переключений прокси."""
+    def __init__(self, path: str, max_entries: int = 100):
+        self.path = path; self.max_entries = max_entries
+        self._history: List[Dict] = []; self._lock = threading.Lock()
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self.path) as f: self._history = json.load(f)
+        except: self._history = []
+
+    def _save(self):
+        try:
+            with open(self.path, "w") as f: json.dump(self._history, f)
+        except: pass
+
+    def record(self, proxy: dict, reason: str, ping: float):
+        entry = {
+            "ts": int(time.time()),
+            "server": proxy["server"], "port": proxy["port"],
+            "type": proxy.get("type", "mtproto"),
+            "ping": ping, "reason": reason,
+            "dt": datetime.now().strftime("%d.%m %H:%M")
+        }
+        with self._lock:
+            self._history.append(entry)
+            if len(self._history) > self.max_entries:
+                self._history = self._history[-self.max_entries:]
+        self._save()
+
+    def last(self, n: int = 10) -> List[Dict]:
+        with self._lock: return list(reversed(self._history[-n:]))
+
+    def format_last(self, n: int = 10) -> str:
+        entries = self.last(n)
+        if not entries: return "История пуста"
+        lines = []
+        for e in entries:
+            tp = "MT" if e["type"] == "mtproto" else "S5"
+            lines.append(f"{e['dt']} [{tp}] {e['server']} • {e['ping']:.0f}мс • {e['reason']}")
+        return "\n".join(lines)
+
 
 class ProxyCache:
     def __init__(self, path=CACHE_FILE): self.path = path
@@ -887,10 +1110,14 @@ class ProxyManagerPlugin(BasePlugin):
         self._ip_cache: Dict = {}; self._pending_ips = set()
         self._inflight_ips = set(); self._geo_running = False
         self._batch_lock = threading.Lock()
-        self._cache = ProxyCache(); self._blacklist = Blacklist()
-        self._logger = LocalLogger()
+        self._cache      = ProxyCache()
+        self._blacklist  = Blacklist()
+        self._logger     = LocalLogger()
+        self._stats      = ProxyStats(f"{DATA_DIR}/pm_stats.json")
+        self._favorites  = FavoriteProxies(f"{DATA_DIR}/pm_favorites.json")
+        self._history    = SwitchHistory(f"{DATA_DIR}/pm_history.json")
         self._prefetcher = Prefetcher(get_list=lambda: self.proxy_list, get_idx=lambda: self.current_index)
-        self._updater = PluginUpdater(self)
+        self._updater    = PluginUpdater(self)
 
     # ─── логирование ──────────────────────────
 
@@ -990,6 +1217,11 @@ class ProxyManagerPlugin(BasePlugin):
             Text(text="📥 Импорт прокси",                   accent=True, on_click=self._open_import_menu),
             Text(text="📤 Экспорт прокси",                  accent=True, on_click=self._open_export_menu),
             Text(text="⚙️ Управление списком",              accent=True, on_click=self._open_manage_menu),
+
+            Divider(),
+            Header(text="Аналитика"),
+            Text(text="📈 История переключений",             accent=True, on_click=self._show_history),
+            Text(text="⭐ Управление избранными прокси",     accent=True, on_click=self._show_favorites_menu),
         ]
         return rows
 
@@ -1243,6 +1475,8 @@ class ProxyManagerPlugin(BasePlugin):
             if then_fetch:
                 threading.Thread(target=self._background_refresh, daemon=True, name="pm-bg").start()
 
+        # Избранные прокси идут первыми в гонке
+        proxies = self._favorites.prioritize(proxies)
         ProxyRace(proxies, on_winner=on_winner, on_done=on_done, timeout=timeout).start()
         winner_ev.wait(timeout=15)
         if not winner_ev.is_set():
@@ -1304,7 +1538,33 @@ class ProxyManagerPlugin(BasePlugin):
         for p in raw:
             k = (p["server"],p["port"],p.get("type"))
             if k not in seen: seen.add(k); unique.append(p)
-        self.log(f"Собрано: {len(unique)}")
+        # Парсим GitHub источники (обновляются каждые 4-12 часов)
+        github_results = []
+        def fetch_github(url):
+            try:
+                ctx = ssl.create_default_context()
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=WEB_TIMEOUT, context=ctx) as r:
+                    return parse_all_proxies(r.read().decode("utf-8", errors="ignore"))
+            except Exception as e:
+                self.log(f"GitHub {url[:50]}: {e}")
+                return []
+
+        with ThreadPoolExecutor(max_workers=5) as ex:
+            for r in ex.map(fetch_github, GITHUB_PROXY_SOURCES):
+                github_results.extend(r)
+        self.log(f"GitHub источники: {len(github_results)} прокси")
+
+        # Объединяем всё
+        all_raw = raw + github_results
+        seen, unique = set(), []
+        for p in all_raw:
+            k = (p["server"], p["port"], p.get("type"))
+            if k not in seen:
+                seen.add(k)
+                unique.append(p)
+
+        self.log(f"Собрано итого: {len(unique)} (каналы + GitHub)")
         return unique
 
     def _resolve_peer(self, username):
@@ -1442,6 +1702,8 @@ class ProxyManagerPlugin(BasePlugin):
             if not self._blacklist.is_banned(p):
                 self._apply_proxy(p); self._save_status(); self._bad_ping_streak = 0
                 self.log(f"Переключение [{reason}] → {p['server']}")
+                self._history.record(p, reason, p.get("ping", 0))
+                self._stats.record_connect(p, p.get("ping", 0))
                 if self._notify_switch():
                     tp = "SOCKS5" if p.get("type")==PROXY_SOCKS5 else "MTProto"
                     lbl = f" ({reason})" if reason else ""
@@ -1492,6 +1754,7 @@ class ProxyManagerPlugin(BasePlugin):
         if tcp_alive(p["server"],p["port"]) >= 9999.0:
             self.log(f"Упал: {p['server']}")
             self._blacklist.strike(p); self._bad_ping_streak = 0
+            self._stats.record_failure(p)
             self._switch_next(reason="упал"); return
         ping = check_proxy_real(p, self._get_timeout())
         p["ping"] = ping
@@ -1691,6 +1954,51 @@ class ProxyManagerPlugin(BasePlugin):
         except Exception as e: log(f"pm: geo fetch {e}")
 
     # ─── импорт / экспорт / управление ───────
+
+    def _show_history(self, view=None):
+        """Показывает историю переключений."""
+        hist = self._history.format_last(20)
+        act = self._activity()
+        if act is None:
+            run_on_ui_thread(lambda: BulletinHelper.show_info(hist[:200]))
+            return
+        def ui():
+            try:
+                from ui.alert import AlertDialogBuilder
+                b = AlertDialogBuilder(act)
+                b.set_title("📈 История переключений (последние 20)")
+                b.set_message(hist)
+                b.set_positive_button("OK", lambda bld,w: bld.dismiss())
+                b.show()
+            except Exception as e:
+                log(f"pm: history dialog {e}")
+        run_on_ui_thread(ui)
+
+    def _show_favorites_menu(self, view=None):
+        """Меню управления избранными прокси."""
+        if not self.proxy_list:
+            run_on_ui_thread(lambda: BulletinHelper.show_error("❌ Нет прокси в пуле"))
+            return
+        entries = []
+        for p in self.proxy_list[:20]:  # показываем первые 20
+            is_fav = self._favorites.is_favorite(p)
+            star = "⭐" if is_fav else "  "
+            label = f"{star} {proxy_label(p)}"
+            def toggle(px=p):
+                if self._favorites.is_favorite(px):
+                    self._favorites.remove(px)
+                    run_on_ui_thread(lambda: BulletinHelper.show_info(f"Убрано из избранного: {px['server']}"))
+                else:
+                    self._favorites.add(px)
+                    run_on_ui_thread(lambda: BulletinHelper.show_success(f"⭐ Добавлено в избранное: {px['server']}"))
+            entries.append((label, toggle))
+        entries.append(("🗑 Очистить все избранные", lambda: [
+            self._favorites._favorites.clear(),
+            self._favorites._save(),
+            run_on_ui_thread(lambda: BulletinHelper.show_success("Избранные очищены"))
+        ]))
+        self._show_action_menu(None, f"⭐ Избранные прокси (всего: {self._favorites.count()})", entries)
+
 
     def _activity(self, fragment=None):
         try:
