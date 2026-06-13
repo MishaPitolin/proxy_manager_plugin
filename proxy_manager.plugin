@@ -6,7 +6,7 @@ __description__ = (
     "ручной режим, авто-переключение по пингу."
 )
 __author__ = "@Shel_Meow"
-__version__ = "6.2.0"
+__version__ = "6.3.0"
 __min_version__ = "12.1.1"
 
 import base64, hashlib, hmac, json, os, re, socket, struct, threading, time
@@ -38,7 +38,7 @@ from ui.settings import Header, Switch, Input, Selector, Text, Divider
 #  КОНСТАНТЫ
 # ═══════════════════════════════════════════════════════════════════
 
-PLUGIN_VERSION    = "6.2.1"
+PLUGIN_VERSION    = "6.3.0"
 UPDATE_CHECK_URL  = "https://raw.githubusercontent.com/MishaPitolin/proxy_manager_plugin/main/version.json"
 UPDATE_PLUGIN_URL = "https://raw.githubusercontent.com/MishaPitolin/proxy_manager_plugin/main/proxy_manager.plugin"
 
@@ -85,10 +85,23 @@ PROXY_SOCKS5  = "socks5"
 SWITCH_AUTO   = "auto"
 SWITCH_MANUAL = "manual"
 
-TCP_TIMEOUT    = 2
-NATIVE_TIMEOUT = 5
-WEB_TIMEOUT    = 6
-RACE_WORKERS   = 30
+TCP_TIMEOUT      = 2
+NATIVE_TIMEOUT   = 5
+WEB_TIMEOUT      = 6
+RACE_WORKERS     = 30
+CACHE_MAX_AGE    = 1800   # 30 минут — кэшируем только проверенные прокси
+CACHE_RECHECK_N  = 5      # сколько прокси из кэша проверяем перед стартом
+STARTUP_TIMEOUT  = 5      # сек — если за это время нет победителя из кэша, парсим заново
+
+# Orbot (Tor) — резервный вариант если всё остальное мертво
+ORBOT_SOCKS5_PORT = 9050
+ORBOT_PACKAGE     = "org.torproject.android"
+ORBOT_PROXY       = {
+    "type": PROXY_SOCKS5, "server": "127.0.0.1", "port": ORBOT_SOCKS5_PORT,
+    "secret": "", "user": "", "pass": "",
+    "link": f"tg://socks?server=127.0.0.1&port={ORBOT_SOCKS5_PORT}",
+    "label": "Tor (Orbot)", "is_orbot": True,
+}
 PREFETCH_COUNT = 3
 BL_STRIKES     = 3
 BL_TTL         = 1800
@@ -646,6 +659,125 @@ def check_proxy_real(proxy: dict, timeout: int) -> float:
 # ═══════════════════════════════════════════════════════════════════
 
 # ═══════════════════════════════════════════════════════════════════
+#  ANDROID УВЕДОМЛЕНИЕ (постоянное, как у VPN)
+# ═══════════════════════════════════════════════════════════════════
+
+NOTIF_CHANNEL_ID = "proxy_manager_status"
+NOTIF_ID         = 7771
+
+def _create_notif_channel():
+    try:
+        from android.app import NotificationChannel, NotificationManager
+        from android.graphics import Color
+        ctx = ApplicationLoader.applicationContext
+        nm  = ctx.getSystemService("notification")
+        if nm.getNotificationChannel(NOTIF_CHANNEL_ID) is None:
+            ch = NotificationChannel(
+                NOTIF_CHANNEL_ID, "Proxy Manager", NotificationManager.IMPORTANCE_LOW)
+            ch.setDescription("Статус прокси подключения")
+            ch.setShowBadge(False)
+            ch.enableLights(False)
+            ch.enableVibration(False)
+            nm.createNotificationChannel(ch)
+    except Exception as e:
+        log(f"pm: notif channel {e}")
+
+def _show_status_notification(title: str, text: str):
+    try:
+        from android.app import Notification, NotificationManager, PendingIntent
+        from android.content import Intent
+        ctx = ApplicationLoader.applicationContext
+        _create_notif_channel()
+
+        # Intent чтобы открыть настройки плагина при тапе
+        intent = ctx.getPackageManager().getLaunchIntentForPackage(ctx.getPackageName())
+        if intent:
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        pi = PendingIntent.getActivity(ctx, 0, intent,
+            PendingIntent.FLAG_UPDATE_CURRENT | PendingIntent.FLAG_IMMUTABLE) if intent else None
+
+        builder = Notification.Builder(ctx, NOTIF_CHANNEL_ID)
+        builder.setSmallIcon(R_tg.drawable.msg2_proxy)
+        builder.setContentTitle(title)
+        builder.setContentText(text)
+        builder.setOngoing(True)     # постоянное уведомление
+        builder.setShowWhen(False)
+        builder.setOnlyAlertOnce(True)
+        if pi: builder.setContentIntent(pi)
+
+        nm = ctx.getSystemService("notification")
+        nm.notify(NOTIF_ID, builder.build())
+    except Exception as e:
+        log(f"pm: notif show {e}")
+
+def _hide_status_notification():
+    try:
+        ctx = ApplicationLoader.applicationContext
+        nm  = ctx.getSystemService("notification")
+        nm.cancel(NOTIF_ID)
+    except Exception as e:
+        log(f"pm: notif hide {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  ORBOT (TOR) — РЕЗЕРВНЫЙ ВАРИАНТ
+# ═══════════════════════════════════════════════════════════════════
+
+def is_orbot_installed() -> bool:
+    """Проверяет установлен ли Orbot."""
+    try:
+        ctx = ApplicationLoader.applicationContext
+        pm = ctx.getPackageManager()
+        pm.getPackageInfo(ORBOT_PACKAGE, 0)
+        return True
+    except: return False
+
+def is_orbot_running() -> bool:
+    """Проверяет запущен ли Tor через Orbot (порт 9050 слушает)."""
+    try:
+        with socket.create_connection(("127.0.0.1", ORBOT_SOCKS5_PORT), timeout=2):
+            return True
+    except: return False
+
+def start_orbot():
+    """Запускает Orbot через Intent если установлен."""
+    try:
+        from android.content import Intent
+        from android.net import Uri
+        ctx = ApplicationLoader.applicationContext
+        intent = Intent("org.torproject.android.intent.action.START")
+        intent.setPackage(ORBOT_PACKAGE)
+        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        ctx.startService(intent)
+        return True
+    except Exception as e:
+        log(f"pm: orbot start {e}")
+        return False
+
+def open_orbot():
+    """Открывает приложение Orbot."""
+    try:
+        from android.content import Intent
+        ctx = ApplicationLoader.applicationContext
+        pm = ctx.getPackageManager()
+        intent = pm.getLaunchIntentForPackage(ORBOT_PACKAGE)
+        if intent:
+            intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            ctx.startActivity(intent)
+            return True
+    except Exception as e:
+        log(f"pm: orbot open {e}")
+    return False
+
+def check_orbot_proxy(timeout: int = 10) -> float:
+    """Проверяет работает ли Tor через Orbot и возвращает пинг."""
+    if not is_orbot_running(): return 9999.0
+    # Проверяем через SOCKS5 хэндшейк
+    result = _check_socks5("127.0.0.1", ORBOT_SOCKS5_PORT, "", "", timeout)
+    return float(result) if result > 0 else 9999.0
+
+
+# ═══════════════════════════════════════════════════════════════════
 #  СТАТИСТИКА И ИЗБРАННЫЕ ПРОКСИ
 # ═══════════════════════════════════════════════════════════════════
 
@@ -930,12 +1062,21 @@ class PluginUpdater:
                 urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}),
                 timeout=30, context=ctx) as r:
                 data = r.read()
-            tmp = f"{DATA_DIR}/_pm_update.plugin"
-            with open(tmp, "wb") as f: f.write(data)
-            self.plugin.install_plugin_from_file(tmp)
-            run_on_ui_thread(lambda: BulletinHelper.show_success("✅ Плагин обновлён!"))
+
+            # Сохраняем поверх текущего файла плагина в папку плагинов
+            plugins_dir = get_plugins_dir()
+            plugin_path = os.path.join(plugins_dir, "proxy_manager.plugin")
+            with open(plugin_path, "wb") as f:
+                f.write(data)
+
+            # Показываем уведомление с инструкцией
+            run_on_ui_thread(lambda: BulletinHelper.show_success(
+                "✅ Плагин обновлён! Выключи и включи его в списке плагинов."
+            ))
+            self.plugin.log(f"Обновление сохранено: {plugin_path}")
         except Exception as e:
             run_on_ui_thread(lambda: BulletinHelper.show_error(f"❌ Ошибка установки: {e}"))
+            self.plugin.log(f"Ошибка обновления: {e}")
     @staticmethod
     def _gt(a, b):
         try: return [int(x) for x in a.split(".")] > [int(x) for x in b.split(".")]
@@ -1118,6 +1259,7 @@ class ProxyManagerPlugin(BasePlugin):
         self._history    = SwitchHistory(f"{DATA_DIR}/pm_history.json")
         self._prefetcher = Prefetcher(get_list=lambda: self.proxy_list, get_idx=lambda: self.current_index)
         self._updater    = PluginUpdater(self)
+        self._orbot_tried = False   # пробовали ли уже Orbot в этой сессии
 
     # ─── логирование ──────────────────────────
 
@@ -1222,6 +1364,21 @@ class ProxyManagerPlugin(BasePlugin):
             Header(text="Аналитика"),
             Text(text="📈 История переключений",             accent=True, on_click=self._show_history),
             Text(text="⭐ Управление избранными прокси",     accent=True, on_click=self._show_favorites_menu),
+
+            Divider(),
+            Header(text="Настройки плагина"),
+            Text(text="📤 Экспорт настроек → Избранное", accent=True, on_click=self._export_plugin_settings),
+            Text(text="📥 Импорт настроек из буфера",    accent=True, on_click=self._import_plugin_settings),
+
+            Divider(),
+            Header(text="🧅 Tor (Orbot) — резервный вариант"),
+            Text(
+                text="Используется только если все прокси мертвы",
+                subtext="Требует установленный Orbot из Play Market",
+            ),
+            Switch(key="orbot_enabled", text="Включить Orbot как резерв", default=True),
+            Text(text="🧅 Проверить Orbot сейчас", accent=True, on_click=self._check_orbot_btn),
+            Text(text="📲 Открыть Orbot",          accent=True, on_click=lambda v=None: run_on_ui_thread(open_orbot)),
         ]
         return rows
 
@@ -1254,7 +1411,7 @@ class ProxyManagerPlugin(BasePlugin):
     def _save_status(self):
         if self.proxy_list and self.active:
             p = self.proxy_list[self.current_index]
-            tp = "MTProto" if p.get("type")==PROXY_MTPROTO else "SOCKS5"
+            tp = "🧅 Tor" if p.get("is_orbot") else ("MTProto" if p.get("type")==PROXY_MTPROTO else "SOCKS5")
             spd = p.get("speed_kbps",0)
             cls = _classify_proxy(type('X', (), {'secret': p.get('secret','')})())
             badge = self.get_setting(f"badge_{cls['badge_key']}", cls["badge"]) or cls["badge"]
@@ -1291,6 +1448,7 @@ class ProxyManagerPlugin(BasePlugin):
     def _manual_reparse(self, view=None):
         if self.loading:
             run_on_ui_thread(lambda: BulletinHelper.show_info("⏳ Уже выполняется...")); return
+        self._orbot_tried = False  # сбрасываем при ручном перезапуске
         run_on_ui_thread(lambda: BulletinHelper.show_info("🏁 Запускаю гонку..."))
         threading.Thread(target=self._startup, daemon=True, name="pm-manual").start()
 
@@ -1423,21 +1581,59 @@ class ProxyManagerPlugin(BasePlugin):
             if self.loading: return
             self.loading = True
         try:
-            cached = self._blacklist.filter(self._cache.load(max_age=3600))
+            # Пробуем кэш с быстрой предпроверкой
+            cached = self._blacklist.filter(self._cache.load(max_age=CACHE_MAX_AGE))
             cached = self._filter_by_type(cached)
+
             if cached:
-                self.log(f"Старт из кэша: {len(cached)}")
-                run_on_ui_thread(lambda: BulletinHelper.show_info(f"⚡ Кэш: {len(cached)} прокси..."))
-                self._run_race(cached, then_fetch=True); return
-            self.log("Кэш пуст, парсю каналы...")
+                self.log(f"Кэш: {len(cached)} прокси — быстро чекаю топ-{CACHE_RECHECK_N}...")
+                run_on_ui_thread(lambda: BulletinHelper.show_info(
+                    f"⚡ Проверяю кэш ({len(cached)} прокси)..."))
+
+                # Быстро чекаем топ-N из кэша параллельно
+                top = cached[:CACHE_RECHECK_N]
+                alive = []
+                lock = threading.Lock()
+                def quick_check(p):
+                    ping = check_proxy_real(p, timeout=3)  # короткий таймаут
+                    if ping < 9999.0:
+                        p["ping"] = ping
+                        with lock: alive.append(p)
+                with ThreadPoolExecutor(max_workers=CACHE_RECHECK_N) as ex:
+                    list(ex.map(quick_check, top))
+
+                if alive:
+                    # Есть живые в кэше — запускаем гонку из всего кэша
+                    alive.sort(key=proxy_score)
+                    self.log(f"Кэш: {len(alive)}/{len(top)} живых — запускаю гонку")
+                    # Ставим живых вперёд
+                    dead_keys = {(p["server"],p["port"]) for p in top if p not in alive}
+                    rest = [p for p in cached if (p["server"],p["port"]) not in dead_keys]
+                    self._run_race(alive + rest, then_fetch=True)
+                    return
+                else:
+                    # Все топ-N мертвы — кэш устарел, парсим заново
+                    self.log(f"Кэш устарел ({len(top)} проверено, все мертвы) — парсю каналы")
+                    self._cache.clear()
+                    run_on_ui_thread(lambda: BulletinHelper.show_info(
+                        "⚠️ Кэш устарел — ищу свежие прокси..."))
+
+            # Полный парсинг каналов + резервные
+            self.log("Парсю каналы...")
             run_on_ui_thread(lambda: BulletinHelper.show_info("🔍 Парсю каналы..."))
             raw = self._fetch_raw_proxies()
             seen = {(p["server"],p["port"]) for p in raw}
             for p in HARDCODED_FALLBACK:
-                if (p["server"],p["port"]) not in seen: raw.append(p); seen.add((p["server"],p["port"]))
+                if (p["server"],p["port"]) not in seen:
+                    raw.append(p); seen.add((p["server"],p["port"]))
             raw = self._blacklist.filter(self._filter_by_type(raw))
+
+            # Приоритизируем FakeTLS с CDN доменом (живут дольше)
+            raw = self._prioritize_by_type(raw)
+
             self.log(f"Гонка: {len(raw)} прокси")
-            run_on_ui_thread(lambda n=len(raw): BulletinHelper.show_info(f"🏁 Гонка: {n} прокси..."))
+            run_on_ui_thread(lambda n=len(raw): BulletinHelper.show_info(
+                f"🏁 Гонка: {n} прокси..."))
             self._run_race(raw, then_fetch=False)
         finally:
             with self.lock: self.loading = False
@@ -1451,7 +1647,7 @@ class ProxyManagerPlugin(BasePlugin):
             run_on_ui_thread(self._add_menu)
             self._prefetcher.start(); self._start_monitor()
             self._start_network_monitor(); self._start_refresh_timer()
-            tp = "MTProto" if p.get("type")==PROXY_MTPROTO else "SOCKS5"
+            tp = "🧅 Tor" if p.get("is_orbot") else ("MTProto" if p.get("type")==PROXY_MTPROTO else "SOCKS5")
             cls = _classify_proxy(type('X',(),{'secret':p.get('secret','')})())
             badge = self.get_setting(f"badge_{cls['badge_key']}", cls["badge"]) or cls["badge"]
             self.log(f"🏆 [{tp}] {badge} {p['server']} {p.get('ping',0):.0f}мс")
@@ -1466,7 +1662,11 @@ class ProxyManagerPlugin(BasePlugin):
                     run_on_ui_thread(lambda: BulletinHelper.show_error("❌ Нет рабочих прокси"))
                 return
             self.proxy_list = results; self.current_index = 0
-            self._save_status(); self._cache.save(results)
+            self._save_status()
+            # Кэшируем только проверенные (у которых есть реальный пинг)
+            verified = [p for p in results if p.get("ping", 0) > 0]
+            self._cache.save(verified)
+            self.log(f"Кэш: сохранено {len(verified)} проверенных прокси")
             mt = sum(1 for p in results if p.get("type")==PROXY_MTPROTO)
             s5 = len(results)-mt
             self.log(f"Гонка завершена: {len(results)} ({mt} MTProto, {s5} SOCKS5)")
@@ -1480,8 +1680,82 @@ class ProxyManagerPlugin(BasePlugin):
         ProxyRace(proxies, on_winner=on_winner, on_done=on_done, timeout=timeout).start()
         winner_ev.wait(timeout=15)
         if not winner_ev.is_set():
-            self.log("Гонка: таймаут 15 сек")
-            run_on_ui_thread(lambda: BulletinHelper.show_error("❌ Никто не ответил за 15 сек"))
+            self.log("Гонка: таймаут 15 сек — пробую Orbot...")
+            run_on_ui_thread(lambda: BulletinHelper.show_error("❌ Нет прокси — пробую Tor (Orbot)..."))
+            threading.Thread(target=self._try_orbot_fallback, daemon=True, name="pm-orbot").start()
+
+    def _try_orbot_fallback(self):
+        """
+        Последний резерв: если все прокси мертвы — пробуем Tor через Orbot.
+        Работает только если Orbot установлен на устройстве.
+        """
+        if self._orbot_tried:
+            run_on_ui_thread(lambda: BulletinHelper.show_error(
+                "❌ Нет рабочих прокси и Orbot не помог. Проверь интернет."))
+            return
+
+        self._orbot_tried = True
+
+        # Проверяем установлен ли Orbot
+        # Проверяем включён ли Orbot в настройках
+        if not self.get_setting("orbot_enabled", True):
+            self.log("Orbot отключён в настройках")
+            run_on_ui_thread(lambda: BulletinHelper.show_error(
+                "❌ Нет рабочих прокси. Включи Orbot в настройках плагина как резерв."))
+            return
+
+        if not is_orbot_installed():
+            self.log("Orbot не установлен")
+            run_on_ui_thread(lambda: BulletinHelper.show_error(
+                "❌ Установи Orbot (Tor) из Play Market как резервный вариант"))
+            return
+
+        self.log("Orbot найден, проверяю...")
+        run_on_ui_thread(lambda: BulletinHelper.show_info("🧅 Пробую Tor через Orbot..."))
+
+        # Если Orbot не запущен — пытаемся запустить
+        if not is_orbot_running():
+            self.log("Orbot не запущен, запускаю...")
+            run_on_ui_thread(lambda: BulletinHelper.show_info(
+                "🧅 Запускаю Orbot... подождите 30 сек"))
+            start_orbot()
+            # Ждём пока Tor поднимется (обычно 15-30 сек)
+            for _ in range(30):
+                time.sleep(1)
+                if is_orbot_running():
+                    self.log("Orbot запустился")
+                    break
+            else:
+                self.log("Orbot не запустился за 30 сек")
+                run_on_ui_thread(lambda: BulletinHelper.show_error(
+                    "❌ Orbot не запустился. Открой Orbot вручную и нажми Start."))
+                run_on_ui_thread(open_orbot)
+                return
+
+        # Проверяем работает ли Tor
+        ping = check_orbot_proxy(timeout=10)
+        if ping >= 9999.0:
+            self.log("Orbot запущен но SOCKS5 не отвечает")
+            run_on_ui_thread(lambda: BulletinHelper.show_error(
+                "❌ Orbot запущен, но Tor не отвечает. Подожди и попробуй снова."))
+            return
+
+        # Применяем Orbot как прокси
+        orbot_proxy = dict(ORBOT_PROXY)
+        orbot_proxy["ping"] = ping
+        self.proxy_list = [orbot_proxy]
+        self.current_index = 0
+        self._apply_proxy(orbot_proxy)
+        self._install_hooks()
+        with self.lock: self.active = True
+        run_on_ui_thread(self._add_menu)
+        self._start_monitor()
+        self._start_network_monitor()
+        self._save_status()
+        self.log(f"✅ Подключено через Tor/Orbot • {ping:.0f} мс")
+        run_on_ui_thread(lambda: BulletinHelper.show_success(
+            f"🧅 Tor • {ping:.0f} мс — скорость ниже обычного, это нормально"))
+
 
     def _background_refresh(self):
         raw = self._fetch_raw_proxies()
@@ -1514,6 +1788,88 @@ class ProxyManagerPlugin(BasePlugin):
         run_on_ui_thread(self._add_menu); self.log("Отключён пользователем")
 
     # ─── парсинг ─────────────────────────────
+
+    def _fetch_and_check_stream(self, on_first: Callable, on_all: Callable):
+        """
+        Параллельный парсинг + проверка: каналы парсятся одновременно,
+        каждый найденный прокси сразу уходит на проверку.
+        on_first(proxy) — первый рабочий, on_all(results) — все готово.
+        """
+        channels = self._get_channels()
+        timeout  = self._get_timeout()
+        results  = []
+        lock     = threading.Lock()
+        first_ev = threading.Event()
+
+        def process_proxy(p):
+            if tcp_alive(p["server"], p["port"]) >= 9999.0: return
+            ping = check_proxy_real(p, timeout)
+            if ping >= 9999.0: return
+            p["ping"] = ping
+            with lock:
+                results.append(p)
+                is_first = not first_ev.is_set()
+            if is_first:
+                first_ev.set()
+                on_first(p)
+            spd = speed_test(p)
+            if spd > 0: p["speed_kbps"] = spd
+
+        def parse_and_submit(username):
+            # Парсим канал
+            proxies = fetch_from_web(username)
+            # Сразу отправляем каждый на проверку
+            with ThreadPoolExecutor(max_workers=5) as ex:
+                list(ex.map(process_proxy, proxies))
+
+        def parse_api_and_submit(username):
+            try:
+                peer = self._resolve_peer(username)
+                if peer is None: return
+                req = TLRPC.TL_messages_getHistory()
+                req.peer = peer
+                req.limit = 50
+                req.offset_id = req.offset_date = req.add_offset = req.max_id = req.min_id = req.hash = 0
+                h = [None]; ev = threading.Event()
+                def cb(r, e, h=h, ev=ev): h[0]=r; ev.set()
+                from client_utils import send_request, RequestCallback
+                send_request(req, RequestCallback(cb)); ev.wait(timeout=6)
+                msgs = h[0]
+                if msgs and hasattr(msgs, "messages"):
+                    proxies = []
+                    for msg in msgs.messages: proxies.extend(extract_from_message(msg))
+                    with ThreadPoolExecutor(max_workers=5) as ex:
+                        list(ex.map(process_proxy, proxies))
+            except Exception as e: self.log(f"API stream {username}: {e}")
+
+        def fetch_github_and_submit(url):
+            proxies = []
+            try:
+                ctx = ssl.create_default_context()
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=WEB_TIMEOUT, context=ctx) as r:
+                    proxies = parse_all_proxies(r.read().decode("utf-8", errors="ignore"))
+            except: pass
+            with ThreadPoolExecutor(max_workers=5) as ex:
+                list(ex.map(process_proxy, proxies))
+
+        # Запускаем всё параллельно
+        tasks = (
+            [lambda u=u: parse_api_and_submit(u) for u in channels] +
+            [lambda u=u: parse_and_submit(u) for u in channels] +
+            [lambda url=url: fetch_github_and_submit(url) for url in GITHUB_PROXY_SOURCES]
+        )
+        with ThreadPoolExecutor(max_workers=20) as ex:
+            list(ex.map(lambda f: f(), tasks))
+
+        # Резервные прокси если совсем ничего
+        if not results:
+            with ThreadPoolExecutor(max_workers=RACE_WORKERS) as ex:
+                list(ex.map(process_proxy, HARDCODED_FALLBACK))
+
+        results.sort(key=proxy_score)
+        on_all(results)
+
 
     def _fetch_raw_proxies(self):
         raw, channels = [], self._get_channels()
@@ -1692,24 +2048,85 @@ class ProxyManagerPlugin(BasePlugin):
 
     # ─── переключение ────────────────────────
 
+    def _prioritize_by_type(self, proxies: List[Dict]) -> List[Dict]:
+        """
+        Приоритизация:
+        1. FakeTLS с CDN доменом (🛡️) — живут дольше всего
+        2. FakeTLS обычный (🔒)
+        3. MTProto random-pad (➿)
+        4. Избранные (вне зависимости от типа)
+        5. Остальные
+        """
+        def priority(p):
+            b = _secret_to_bytes(p.get("secret",""))
+            if b and b[0] == 0xEE and len(b) >= 17:
+                dom = b[17:].decode("utf-8","replace").strip()
+                if any(dom == d or dom.endswith("."+d) for d in _GOOD_FRONTS):
+                    return 0  # FakeTLS + CDN — лучший
+                return 1      # FakeTLS обычный
+            if b and b[0] == 0xDD:
+                return 2      # random-pad
+            return 3          # остальные
+
+        # Избранные идут первыми независимо от типа
+        favs = [p for p in proxies if self._favorites.is_favorite(p)]
+        rest = [p for p in proxies if not self._favorites.is_favorite(p)]
+        rest.sort(key=priority)
+        return favs + rest
+
+    def _weighted_next(self) -> Optional[Dict]:
+        """
+        Weighted rotation: прокси с высоким uptime получает больше шансов.
+        Возвращает следующий прокси или None если список пуст.
+        """
+        candidates = [
+            (i, p) for i, p in enumerate(self.proxy_list)
+            if i != self.current_index and not self._blacklist.is_banned(p)
+        ]
+        if not candidates: return None
+
+        # Считаем веса на основе uptime из статистики
+        weights = []
+        for i, p in candidates:
+            uptime = self._stats.uptime(p)
+            uses   = self._stats.uses(p)
+            # Новые прокси (uses==0) получают средний вес 50
+            w = max(1, uptime if uses > 0 else 50)
+            weights.append((i, p, w))
+
+        # Weighted random выбор
+        import random
+        total = sum(w for _, _, w in weights)
+        r = random.uniform(0, total)
+        cumulative = 0
+        for i, p, w in weights:
+            cumulative += w
+            if r <= cumulative:
+                return (i, p)
+        return weights[-1][:2]  # fallback на последний
+
+
     def _switch_next(self, reason=""):
         if self._is_manual(): self.log(f"Ручной режим — пропуск ({reason})"); return
         good = self._blacklist.filter(self.proxy_list)
         if not good: threading.Thread(target=self._startup, daemon=True).start(); return
-        for _ in range(len(self.proxy_list)):
-            self.current_index = (self.current_index+1)%len(self.proxy_list)
-            p = self.proxy_list[self.current_index]
-            if not self._blacklist.is_banned(p):
-                self._apply_proxy(p); self._save_status(); self._bad_ping_streak = 0
-                self.log(f"Переключение [{reason}] → {p['server']}")
-                self._history.record(p, reason, p.get("ping", 0))
-                self._stats.record_connect(p, p.get("ping", 0))
-                if self._notify_switch():
-                    tp = "SOCKS5" if p.get("type")==PROXY_SOCKS5 else "MTProto"
-                    lbl = f" ({reason})" if reason else ""
-                    run_on_ui_thread(lambda: BulletinHelper.show_info(
-                        f"🔄 [{tp}] {p['server']} • {p.get('ping',0):.0f} мс{lbl}"))
-                return
+
+        # Weighted rotation — учитываем uptime из статистики
+        result = self._weighted_next()
+        if result is None:
+            threading.Thread(target=self._startup, daemon=True).start(); return
+
+        new_idx, p = result
+        self.current_index = new_idx
+        self._apply_proxy(p); self._save_status(); self._bad_ping_streak = 0
+        self.log(f"Переключение [{reason}] → {p['server']} (uptime {self._stats.uptime(p):.0f}%)")
+        self._history.record(p, reason, p.get("ping", 0))
+        self._stats.record_connect(p, p.get("ping", 0))
+        if self._notify_switch():
+            tp = "🧅 Tor" if p.get("is_orbot") else ("SOCKS5" if p.get("type")==PROXY_SOCKS5 else "MTProto")
+            lbl = f" ({reason})" if reason else ""
+            run_on_ui_thread(lambda: BulletinHelper.show_info(
+                f"🔄 [{tp}] {p['server']} • {p.get('ping',0):.0f} мс{lbl}"))
 
     def _find_better_proxy(self, current_ping: float):
         if self._is_manual(): return
@@ -1954,6 +2371,60 @@ class ProxyManagerPlugin(BasePlugin):
         except Exception as e: log(f"pm: geo fetch {e}")
 
     # ─── импорт / экспорт / управление ───────
+
+    def _export_plugin_settings(self, view=None):
+        """Экспортирует все настройки плагина в JSON и отправляет в Избранное."""
+        def task():
+            try:
+                data = self.export_settings()
+                txt  = json.dumps(data, ensure_ascii=False, indent=2)
+                uid  = get_user_config().getClientUserId()
+                send_message({"peer": uid, "message": f"```json\n{txt}\n```"})
+                run_on_ui_thread(lambda: BulletinHelper.show_success(
+                    "📤 Настройки отправлены в Избранное"))
+            except Exception as e:
+                run_on_ui_thread(lambda: BulletinHelper.show_error(f"Ошибка: {e}"))
+        threading.Thread(target=task, daemon=True).start()
+
+    def _import_plugin_settings(self, view=None):
+        """Импортирует настройки из буфера обмена."""
+        def ui():
+            try:
+                clip = ApplicationLoader.applicationContext.getSystemService("clipboard")
+                if not clip or not clip.hasPrimaryClip():
+                    BulletinHelper.show_error("Буфер пуст"); return
+                raw = str(clip.getPrimaryClip().getItemAt(0).getText() or "")
+                # Убираем markdown блок если есть
+                raw = re.sub(r"```json\n?|```", "", raw).strip()
+                data = json.loads(raw)
+                self.import_settings(data, reload_settings=True)
+                BulletinHelper.show_success("✅ Настройки импортированы!")
+            except Exception as e:
+                BulletinHelper.show_error(f"Ошибка импорта: {e}")
+        run_on_ui_thread(ui)
+
+
+    def _check_orbot_btn(self, view=None):
+        """Кнопка ручной проверки Orbot в настройках."""
+        if not is_orbot_installed():
+            run_on_ui_thread(lambda: BulletinHelper.show_error(
+                "❌ Orbot не установлен. Скачай из Play Market: Orbot: Tor on Android"))
+            return
+        run_on_ui_thread(lambda: BulletinHelper.show_info("🧅 Проверяю Orbot..."))
+        def check():
+            running = is_orbot_running()
+            if not running:
+                run_on_ui_thread(lambda: BulletinHelper.show_error(
+                    "⚠️ Orbot установлен, но не запущен. Открой и нажми Start."))
+                return
+            ping = check_orbot_proxy(timeout=10)
+            if ping < 9999.0:
+                run_on_ui_thread(lambda: BulletinHelper.show_success(
+                    f"✅ Orbot работает • {ping:.0f} мс"))
+            else:
+                run_on_ui_thread(lambda: BulletinHelper.show_error(
+                    "❌ Orbot запущен но не отвечает. Подожди пока Tor поднимется."))
+        threading.Thread(target=check, daemon=True).start()
 
     def _show_history(self, view=None):
         """Показывает историю переключений."""
