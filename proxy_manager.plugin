@@ -1063,20 +1063,83 @@ class PluginUpdater:
                 timeout=30, context=ctx) as r:
                 data = r.read()
 
-            # Сохраняем поверх текущего файла плагина в папку плагинов
+            # Сохраняем поверх текущего файла в папку плагинов
             plugins_dir = get_plugins_dir()
             plugin_path = os.path.join(plugins_dir, "proxy_manager.plugin")
             with open(plugin_path, "wb") as f:
                 f.write(data)
+            self.plugin.log(f"Файл обновлён: {plugin_path}")
 
-            # Показываем уведомление с инструкцией
-            run_on_ui_thread(lambda: BulletinHelper.show_success(
-                "✅ Плагин обновлён! Выключи и включи его в списке плагинов."
-            ))
-            self.plugin.log(f"Обновление сохранено: {plugin_path}")
+            # Пробуем перезагрузить плагин через PythonPluginsEngine
+            run_on_ui_thread(lambda: self._reload_self(plugin_path))
+
         except Exception as e:
             run_on_ui_thread(lambda: BulletinHelper.show_error(f"❌ Ошибка установки: {e}"))
             self.plugin.log(f"Ошибка обновления: {e}")
+
+    def _reload_self(self, plugin_path: str):
+        """Перезагружает текущий плагин через PythonPluginsEngine."""
+        try:
+            # Получаем движок плагинов через хук
+            engine_cls = find_class("com.exteragram.messenger.plugins.PythonPluginsEngine")
+            if engine_cls is None:
+                raise Exception("PythonPluginsEngine не найден")
+
+            # Получаем singleton экземпляр движка
+            engine = None
+            try:
+                get_instance = engine_cls.getClass().getDeclaredMethod("getInstance")
+                get_instance.setAccessible(True)
+                engine = get_instance.invoke(None)
+            except Exception:
+                pass
+
+            # Fallback: через статическое поле instance
+            if engine is None:
+                try:
+                    f = engine_cls.getClass().getDeclaredField("instance")
+                    f.setAccessible(True)
+                    engine = f.get(None)
+                except Exception:
+                    pass
+
+            if engine is None:
+                raise Exception("Не удалось получить экземпляр движка")
+
+            # Выгружаем плагин
+            try:
+                unload = engine_cls.getClass().getDeclaredMethod(
+                    "unloadPlugin", find_class("java.lang.String"))
+                unload.setAccessible(True)
+                unload.invoke(engine, "proxy_manager")
+            except Exception as e:
+                self.plugin.log(f"unload: {e}")
+
+            # Небольшая задержка
+            import time as _t; _t.sleep(0.5)
+
+            # Загружаем обновлённый файл
+            try:
+                load = engine_cls.getClass().getDeclaredMethod(
+                    "loadPluginFromFile", find_class("java.io.File"))
+                load.setAccessible(True)
+                file_cls = find_class("java.io.File")
+                f = file_cls.getConstructor(find_class("java.lang.String")).newInstance(plugin_path)
+                load.invoke(engine, f)
+                BulletinHelper.show_success("✅ Плагин обновлён и перезагружен!")
+                self.plugin.log("Плагин успешно перезагружен")
+                return
+            except Exception as e:
+                self.plugin.log(f"loadPluginFromFile: {e}")
+
+            # Если не вышло — просим пользователя перезагрузить вручную
+            BulletinHelper.show_success(
+                "✅ Файл обновлён! Выключи и включи плагин в списке.")
+
+        except Exception as e:
+            self.plugin.log(f"_reload_self: {e}")
+            BulletinHelper.show_success(
+                "✅ Файл обновлён! Выключи и включи плагин в списке.")
     @staticmethod
     def _gt(a, b):
         try: return [int(x) for x in a.split(".")] > [int(x) for x in b.split(".")]
@@ -1338,9 +1401,10 @@ class ProxyManagerPlugin(BasePlugin):
 
             Divider(),
             Header(text="Уведомления"),
-            Switch(key="notify_switch",  text="При переключении прокси", default=True),
-            Switch(key="notify_network", text="При смене сети",           default=True),
-            Switch(key="notify_refresh", text="При обновлении базы",      default=False),
+            Switch(key="notify_switch",     text="При переключении прокси",        default=True),
+            Switch(key="notify_network",    text="При смене сети",                  default=True),
+            Switch(key="notify_refresh",    text="При обновлении базы",             default=False),
+            Switch(key="show_notification", text="Постоянное Android-уведомление",  default=True),
 
             Header(text="Плагин"),
             Switch(key="auto_update", text="Авто-обновление при старте", default=True),
@@ -1489,6 +1553,7 @@ class ProxyManagerPlugin(BasePlugin):
         try: self.remove_menu_item("pm_toggle")
         except: pass
         run_on_ui_thread(self._disable_proxy_globally)
+        run_on_ui_thread(_hide_status_notification)
         self.log("=== Proxy Manager выгружен ===")
 
     def on_app_event(self, et):
@@ -1785,6 +1850,7 @@ class ProxyManagerPlugin(BasePlugin):
         self.set_setting("_status_line","🔴 Неактивен"); self.set_setting("_status_sub",f"В базе: {len(self.proxy_list)}")
         run_on_ui_thread(self._disable_proxy_globally)
         run_on_ui_thread(lambda: BulletinHelper.show_info("Proxy Manager отключён"))
+        run_on_ui_thread(_hide_status_notification)
         run_on_ui_thread(self._add_menu); self.log("Отключён пользователем")
 
     # ─── парсинг ─────────────────────────────
@@ -2127,6 +2193,14 @@ class ProxyManagerPlugin(BasePlugin):
             lbl = f" ({reason})" if reason else ""
             run_on_ui_thread(lambda: BulletinHelper.show_info(
                 f"🔄 [{tp}] {p['server']} • {p.get('ping',0):.0f} мс{lbl}"))
+        # Обновляем Android уведомление
+        if self.get_setting("show_notification", True):
+            cls = _classify_proxy(type('X',(),{'secret':p.get('secret','')})())
+            badge = self.get_setting(f"badge_{cls['badge_key']}", cls["badge"]) or cls["badge"]
+            run_on_ui_thread(lambda: _show_status_notification(
+                f"🔄 Proxy Manager • {p.get('ping',0):.0f} мс",
+                f"{badge} {p['server']}:{p['port']}"
+            ))
 
     def _find_better_proxy(self, current_ping: float):
         if self._is_manual(): return
