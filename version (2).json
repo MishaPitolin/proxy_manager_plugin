@@ -1,5 +1,0 @@
-{
-  "version": "6.3.1",
-  "url": "https://raw.githubusercontent.com/MishaPitolin/proxy_manager_plugin/main/proxy_manager.plugin",
-  "changelog": "v6.3.1: фикс автообновления — плагин теперь реально перезагружается через PythonPluginsEngine"
-}
