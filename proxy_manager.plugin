@@ -6,7 +6,7 @@ __description__ = (
     "ручной режим, авто-переключение по пингу."
 )
 __author__ = "@Shel_Meow"
-__version__ = "6.3.0"
+__version__ = "6.4.0"
 __min_version__ = "12.1.1"
 
 import base64, hashlib, hmac, json, os, re, socket, struct, threading, time
