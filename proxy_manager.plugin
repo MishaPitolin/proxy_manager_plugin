@@ -93,6 +93,18 @@ CACHE_MAX_AGE    = 1800   # 30 минут — кэшируем только пр
 CACHE_RECHECK_N  = 5      # сколько прокси из кэша проверяем перед стартом
 STARTUP_TIMEOUT  = 5      # сек — если за это время нет победителя из кэша, парсим заново
 
+# Стабильность и скорость
+PRECONNECT_COUNT    = 3      # держим N следующих прокси "тёплыми"
+PARALLEL_RACE_N     = 3      # при переключении гоним топ-N параллельно
+STICKY_MIN_SECS     = 600    # если прокси работает >10 мин, не трогаем при небольшом росте пинга
+STICKY_THRESHOLD    = 1.5    # переключаемся только если пинг вырос в 1.5x от среднего
+JITTER_WINDOW       = 5      # измерений для подсчёта jitter
+JITTER_THRESHOLD_MS = 150    # если стд.откл. пинга > этого — прокси нестабилен
+BACKOFF_BASE_SECS   = 60     # базовая задержка повторной попытки (экспоненциальный рост)
+BACKOFF_MAX_SECS    = 1800   # максимальная задержка (30 мин)
+CHANNEL_SCORE_FILE  = f"{DATA_DIR}/pm_channel_scores.json"
+DEDUP_IP_RESOLVE    = True   # дедупликация по IP через DoH
+
 # Orbot (Tor) — резервный вариант если всё остальное мертво
 ORBOT_SOCKS5_PORT = 9050
 ORBOT_PACKAGE     = "org.torproject.android"
@@ -719,6 +731,176 @@ def _hide_status_notification():
         log(f"pm: notif hide {e}")
 
 
+
+# ═══════════════════════════════════════════════════════════════════
+#  EXPONENTIAL BACKOFF BLACKLIST
+# ═══════════════════════════════════════════════════════════════════
+
+class BackoffBlacklist(Blacklist):
+    """Расширенный блэклист с экспоненциальным backoff вместо фиксированного TTL."""
+
+    def __init__(self):
+        super().__init__()
+        self._backoff_count: Dict[str, int] = {}  # сколько раз баним этот прокси
+
+    def strike(self, p):
+        k = self._key(p)
+        with self._lock:
+            self._strikes[k] = self._strikes.get(k, 0) + 1
+            if self._strikes[k] >= BL_STRIKES:
+                count = self._backoff_count.get(k, 0)
+                # Exponential backoff: 60 → 120 → 240 → ... → 1800 сек
+                delay = min(BACKOFF_BASE_SECS * (2 ** count), BACKOFF_MAX_SECS)
+                self._banned[k] = time.time() + delay
+                self._backoff_count[k] = count + 1
+                self._strikes[k] = 0
+                log(f"pm: backoff {k} на {delay:.0f}с (попытка {count+1})")
+
+    def reset(self, p):
+        k = self._key(p)
+        with self._lock:
+            self._strikes.pop(k, None)
+            self._banned.pop(k, None)
+            self._backoff_count.pop(k, None)  # сбрасываем счётчик при успехе
+
+    def clear(self):
+        with self._lock:
+            self._strikes.clear()
+            self._banned.clear()
+            self._backoff_count.clear()
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  JITTER TRACKER — считает нестабильность пинга
+# ═══════════════════════════════════════════════════════════════════
+
+class JitterTracker:
+    """Хранит последние N замеров пинга и считает стандартное отклонение."""
+
+    def __init__(self, window: int = JITTER_WINDOW):
+        self._window = window
+        self._samples: Dict[str, List[float]] = {}
+        self._lock = threading.Lock()
+
+    def _key(self, p: dict) -> str:
+        return f"{p['server']}:{p['port']}"
+
+    def record(self, p: dict, ping: float):
+        if ping >= 9999.0: return
+        k = self._key(p)
+        with self._lock:
+            samples = self._samples.setdefault(k, [])
+            samples.append(ping)
+            if len(samples) > self._window:
+                samples.pop(0)
+
+    def jitter(self, p: dict) -> float:
+        """Возвращает стандартное отклонение пинга (мс). 0 если мало данных."""
+        k = self._key(p)
+        with self._lock:
+            samples = self._samples.get(k, [])
+        if len(samples) < 2: return 0.0
+        mean = sum(samples) / len(samples)
+        variance = sum((x - mean) ** 2 for x in samples) / len(samples)
+        return variance ** 0.5
+
+    def is_unstable(self, p: dict) -> bool:
+        return self.jitter(p) > JITTER_THRESHOLD_MS
+
+    def reset(self, p: dict):
+        k = self._key(p)
+        with self._lock:
+            self._samples.pop(k, None)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  CHANNEL SCORER — помнит какие каналы дают больше живых прокси
+# ═══════════════════════════════════════════════════════════════════
+
+class ChannelScorer:
+    """Ранжирует каналы по проценту живых прокси."""
+
+    def __init__(self, path: str = CHANNEL_SCORE_FILE):
+        self.path = path
+        self._scores: Dict[str, Dict] = {}
+        self._lock = threading.Lock()
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self.path) as f:
+                self._scores = json.load(f)
+        except: self._scores = {}
+
+    def _save(self):
+        try:
+            with open(self.path, "w") as f:
+                json.dump(self._scores, f)
+        except: pass
+
+    def record(self, channel: str, found: int, alive: int):
+        with self._lock:
+            d = self._scores.setdefault(channel, {"found": 0, "alive": 0, "runs": 0})
+            d["found"] += found
+            d["alive"] += alive
+            d["runs"]  += 1
+        self._save()
+
+    def score(self, channel: str) -> float:
+        """Процент живых прокси от найденных. Новые каналы получают 50 (нейтрально)."""
+        with self._lock:
+            d = self._scores.get(channel, {})
+        found = d.get("found", 0)
+        alive = d.get("alive", 0)
+        return (alive / found * 100) if found > 0 else 50.0
+
+    def sort_channels(self, channels: List[str]) -> List[str]:
+        """Сортирует каналы по убыванию score — лучшие парсим первыми."""
+        return sorted(channels, key=lambda c: self.score(c), reverse=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  DNS CACHE — кэш резолвинга для быстрого переключения
+# ═══════════════════════════════════════════════════════════════════
+
+class DNSCache:
+    """Кэш DoH резолвинга — заранее резолвим домены следующих прокси."""
+
+    def __init__(self, ttl: int = 300):
+        self._cache: Dict[str, tuple] = {}  # host -> (ip, expires)
+        self._lock = threading.Lock()
+        self._ttl = ttl
+
+    def get(self, host: str) -> Optional[str]:
+        with self._lock:
+            entry = self._cache.get(host)
+        if not entry: return None
+        ip, expires = entry
+        if time.time() > expires: return None
+        return ip
+
+    def set(self, host: str, ip: str):
+        with self._lock:
+            self._cache[host] = (ip, time.time() + self._ttl)
+
+    def resolve(self, host: str) -> str:
+        """Резолвит через кэш → DoH → системный DNS."""
+        cached = self.get(host)
+        if cached: return cached
+        ip = resolve_host_doh(host)
+        if ip != host: self.set(host, ip)
+        return ip
+
+    def prefetch(self, proxies: List[Dict]):
+        """Заранее резолвит домены списка прокси в фоне."""
+        def _resolve_one(p):
+            host = p.get("server", "")
+            if host and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", host):
+                self.resolve(host)
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            list(ex.map(_resolve_one, proxies))
+
+
 # ═══════════════════════════════════════════════════════════════════
 #  ORBOT (TOR) — РЕЗЕРВНЫЙ ВАРИАНТ
 # ═══════════════════════════════════════════════════════════════════
@@ -1314,15 +1496,20 @@ class ProxyManagerPlugin(BasePlugin):
         self._ip_cache: Dict = {}; self._pending_ips = set()
         self._inflight_ips = set(); self._geo_running = False
         self._batch_lock = threading.Lock()
-        self._cache      = ProxyCache()
-        self._blacklist  = Blacklist()
-        self._logger     = LocalLogger()
-        self._stats      = ProxyStats(f"{DATA_DIR}/pm_stats.json")
-        self._favorites  = FavoriteProxies(f"{DATA_DIR}/pm_favorites.json")
-        self._history    = SwitchHistory(f"{DATA_DIR}/pm_history.json")
-        self._prefetcher = Prefetcher(get_list=lambda: self.proxy_list, get_idx=lambda: self.current_index)
-        self._updater    = PluginUpdater(self)
-        self._orbot_tried = False   # пробовали ли уже Orbot в этой сессии
+        self._cache         = ProxyCache()
+        self._blacklist     = BackoffBlacklist()   # exponential backoff
+        self._logger        = LocalLogger()
+        self._stats         = ProxyStats(f"{DATA_DIR}/pm_stats.json")
+        self._favorites     = FavoriteProxies(f"{DATA_DIR}/pm_favorites.json")
+        self._history       = SwitchHistory(f"{DATA_DIR}/pm_history.json")
+        self._jitter        = JitterTracker()
+        self._ch_scorer     = ChannelScorer()
+        self._dns_cache     = DNSCache()
+        self._prefetcher    = Prefetcher(get_list=lambda: self.proxy_list, get_idx=lambda: self.current_index)
+        self._updater       = PluginUpdater(self)
+        self._orbot_tried   = False
+        self._sticky_since  = 0.0    # время подключения к текущему прокси
+        self._ping_history  = []     # последние N пингов текущего прокси
 
     # ─── логирование ──────────────────────────
 
@@ -1448,7 +1635,9 @@ class ProxyManagerPlugin(BasePlugin):
 
     def _get_channels(self):
         raw = self.get_setting("channels", DEFAULT_CHANNELS)
-        return [c.strip() for c in str(raw).split(",") if c.strip()]
+        channels = [c.strip() for c in str(raw).split(",") if c.strip()]
+        # Сортируем по score — лучшие каналы парсим первыми
+        return self._ch_scorer.sort_channels(channels)
     def _get_interval(self):
         idx = safe_int(self.get_setting("check_interval",2),2)
         return INTERVAL_OPTIONS[idx] if 0 <= idx < len(INTERVAL_OPTIONS) else 30
@@ -1693,8 +1882,13 @@ class ProxyManagerPlugin(BasePlugin):
                     raw.append(p); seen.add((p["server"],p["port"]))
             raw = self._blacklist.filter(self._filter_by_type(raw))
 
+            # IP дедупликация — убираем дубликаты по реальному адресу
+            raw = self._dedup_by_ip(raw)
             # Приоритизируем FakeTLS с CDN доменом (живут дольше)
             raw = self._prioritize_by_type(raw)
+            # DNS prefetch всех кандидатов в фоне
+            threading.Thread(target=self._dns_cache.prefetch,
+                             args=(raw[:30],), daemon=True, name="pm-dns-prefetch-startup").start()
 
             self.log(f"Гонка: {len(raw)} прокси")
             run_on_ui_thread(lambda n=len(raw): BulletinHelper.show_info(
@@ -1989,6 +2183,14 @@ class ProxyManagerPlugin(BasePlugin):
         self.log(f"Собрано итого: {len(unique)} (каналы + GitHub)")
         return unique
 
+    def _record_channel_scores(self, channels: List[str], results: List[Dict]):
+        """Записываем какие каналы дали сколько живых прокси."""
+        # Упрощённо: делим найденные равномерно (точнее не отследить без меток)
+        if not channels or not results: return
+        per_channel = max(1, len(results) // len(channels))
+        for ch in channels:
+            self._ch_scorer.record(ch, found=per_channel, alive=per_channel // 2)
+
     def _resolve_peer(self, username):
         try:
             ctrl = MessagesController.getInstance(UserConfig.selectedAccount)
@@ -2114,6 +2316,19 @@ class ProxyManagerPlugin(BasePlugin):
 
     # ─── переключение ────────────────────────
 
+    def _dedup_by_ip(self, proxies: List[Dict]) -> List[Dict]:
+        """Дедупликация по реальному IP — убирает разные домены указывающие на один сервер."""
+        if not DEDUP_IP_RESOLVE: return proxies
+        seen_ips = set(); result = []
+        for p in proxies:
+            ip = self._dns_cache.resolve(p["server"])
+            key = (ip, p["port"])
+            if key not in seen_ips:
+                seen_ips.add(key); result.append(p)
+        removed = len(proxies) - len(result)
+        if removed > 0: self.log(f"IP дедупликация: убрано {removed} дубликатов")
+        return result
+
     def _prioritize_by_type(self, proxies: List[Dict]) -> List[Dict]:
         """
         Приоритизация:
@@ -2140,36 +2355,62 @@ class ProxyManagerPlugin(BasePlugin):
         rest.sort(key=priority)
         return favs + rest
 
-    def _weighted_next(self) -> Optional[Dict]:
+    def _weighted_next(self) -> Optional[tuple]:
         """
         Weighted rotation: прокси с высоким uptime получает больше шансов.
-        Возвращает следующий прокси или None если список пуст.
+        Исключает нестабильные (высокий jitter) прокси.
         """
+        import random
         candidates = [
             (i, p) for i, p in enumerate(self.proxy_list)
             if i != self.current_index and not self._blacklist.is_banned(p)
         ]
         if not candidates: return None
 
-        # Считаем веса на основе uptime из статистики
         weights = []
         for i, p in candidates:
             uptime = self._stats.uptime(p)
             uses   = self._stats.uses(p)
-            # Новые прокси (uses==0) получают средний вес 50
             w = max(1, uptime if uses > 0 else 50)
+            # Штраф за высокий jitter
+            if self._jitter.is_unstable(p): w *= 0.3
             weights.append((i, p, w))
 
-        # Weighted random выбор
-        import random
         total = sum(w for _, _, w in weights)
-        r = random.uniform(0, total)
-        cumulative = 0
+        r = random.uniform(0, total); cumulative = 0
         for i, p, w in weights:
             cumulative += w
-            if r <= cumulative:
-                return (i, p)
-        return weights[-1][:2]  # fallback на последний
+            if r <= cumulative: return (i, p)
+        return weights[-1][:2]
+
+    def _parallel_switch(self, candidates: List[tuple]) -> Optional[tuple]:
+        """
+        Parallel connect race: подключаемся к топ-N прокси одновременно,
+        берём тот что ответил первым.
+        candidates: список (idx, proxy)
+        """
+        winner = [None]; winner_ev = threading.Event(); lock = threading.Lock()
+        timeout = self._get_timeout()
+
+        def try_one(idx_proxy):
+            i, p = idx_proxy
+            # Используем DNS кэш
+            resolved = self._dns_cache.resolve(p["server"])
+            p_resolved = dict(p); p_resolved["server"] = resolved
+            ping = check_proxy_real(p_resolved, timeout)
+            if ping < 9999.0:
+                p["ping"] = ping
+                with lock:
+                    if not winner_ev.is_set():
+                        winner[0] = (i, p)
+                        winner_ev.set()
+
+        with ThreadPoolExecutor(max_workers=len(candidates)) as ex:
+            futures = [ex.submit(try_one, c) for c in candidates]
+            winner_ev.wait(timeout=timeout + 1)
+            # Отменяем оставшиеся (они завершатся сами)
+
+        return winner[0]
 
 
     def _switch_next(self, reason=""):
@@ -2177,15 +2418,43 @@ class ProxyManagerPlugin(BasePlugin):
         good = self._blacklist.filter(self.proxy_list)
         if not good: threading.Thread(target=self._startup, daemon=True).start(); return
 
-        # Weighted rotation — учитываем uptime из статистики
-        result = self._weighted_next()
+        # Берём топ-N кандидатов по weighted score для parallel race
+        import random
+        candidates_pool = [
+            (i, p) for i, p in enumerate(self.proxy_list)
+            if i != self.current_index and not self._blacklist.is_banned(p)
+        ]
+        if not candidates_pool:
+            threading.Thread(target=self._startup, daemon=True).start(); return
+
+        # Сортируем по weighted score, берём топ-N
+        def wscore(ip):
+            i, p = ip
+            uptime = self._stats.uptime(p)
+            uses   = self._stats.uses(p)
+            w = uptime if uses > 0 else 50
+            if self._jitter.is_unstable(p): w *= 0.3
+            return -w  # отрицательный для сортировки по убыванию
+
+        candidates_pool.sort(key=wscore)
+        top_candidates = candidates_pool[:PARALLEL_RACE_N]
+
+        self.log(f"Parallel race: {len(top_candidates)} кандидатов для [{reason}]")
+
+        # Parallel connect race — победитель применяется
+        result = self._parallel_switch(top_candidates)
+        if result is None:
+            # Никто не ответил — пробуем остальных по одному
+            result = self._weighted_next()
         if result is None:
             threading.Thread(target=self._startup, daemon=True).start(); return
 
         new_idx, p = result
         self.current_index = new_idx
+        self._sticky_since = time.monotonic()  # начало sticky session
+        self._jitter.reset(p)                   # сбрасываем jitter для нового прокси
         self._apply_proxy(p); self._save_status(); self._bad_ping_streak = 0
-        self.log(f"Переключение [{reason}] → {p['server']} (uptime {self._stats.uptime(p):.0f}%)")
+        self.log(f"Переключение [{reason}] → {p['server']} • {p.get('ping',0):.0f}мс")
         self._history.record(p, reason, p.get("ping", 0))
         self._stats.record_connect(p, p.get("ping", 0))
         if self._notify_switch():
@@ -2193,7 +2462,6 @@ class ProxyManagerPlugin(BasePlugin):
             lbl = f" ({reason})" if reason else ""
             run_on_ui_thread(lambda: BulletinHelper.show_info(
                 f"🔄 [{tp}] {p['server']} • {p.get('ping',0):.0f} мс{lbl}"))
-        # Обновляем Android уведомление
         if self.get_setting("show_notification", True):
             cls = _classify_proxy(type('X',(),{'secret':p.get('secret','')})())
             badge = self.get_setting(f"badge_{cls['badge_key']}", cls["badge"]) or cls["badge"]
@@ -2241,22 +2509,64 @@ class ProxyManagerPlugin(BasePlugin):
 
     def _check_current(self):
         if not self.proxy_list: return
-        p = self.proxy_list[self.current_index]; threshold = self._get_threshold()
-        if tcp_alive(p["server"],p["port"]) >= 9999.0:
+        p = self.proxy_list[self.current_index]
+        threshold = self._get_threshold()
+        resolved_host = self._dns_cache.resolve(p["server"])
+
+        # TCP чек с резолвленным IP
+        if tcp_alive(resolved_host, p["port"]) >= 9999.0:
             self.log(f"Упал: {p['server']}")
             self._blacklist.strike(p); self._bad_ping_streak = 0
-            self._stats.record_failure(p)
+            self._stats.record_failure(p); self._jitter.reset(p)
+            self._sticky_since = 0.0
             self._switch_next(reason="упал"); return
+
+        # Реальный пинг
         ping = check_proxy_real(p, self._get_timeout())
         p["ping"] = ping
-        self.log(f"Пинг {p['server']}: {ping:.0f}мс (порог {threshold:.0f}, streak {self._bad_ping_streak})")
+
+        # Записываем в jitter tracker
+        self._jitter.record(p, ping)
+        jitter = self._jitter.jitter(p)
+        self.log(f"Пинг {p['server']}: {ping:.0f}мс jitter:{jitter:.0f}мс streak:{self._bad_ping_streak}")
+
+        # Sticky session: если прокси работает давно и стабильно — не трогаем
+        uptime_secs = time.monotonic() - self._sticky_since if self._sticky_since > 0 else 0
+        if uptime_secs > STICKY_MIN_SECS:
+            # Переключаемся только если пинг вырос в STICKY_THRESHOLD раз от нормы
+            avg = self._stats.avg_ping(p)
+            if avg > 0 and ping < avg * STICKY_THRESHOLD:
+                self.log(f"Sticky: {uptime_secs:.0f}с аптайм, пинг в норме ({ping:.0f} < {avg*STICKY_THRESHOLD:.0f})")
+                self._save_status(); return
+
+        # Jitter detection: нестабильный прокси
+        if self._jitter.is_unstable(p) and uptime_secs < STICKY_MIN_SECS:
+            self.log(f"Нестабильный jitter {jitter:.0f}мс — ищу лучший")
+            self._find_better_proxy(current_ping=ping)
+            return
+
+        # Обычная проверка порога
         if ping > threshold:
             self._bad_ping_streak += 1
             if self._bad_ping_streak >= SWITCH_CONFIRM_COUNT:
-                self._bad_ping_streak = 0; self._find_better_proxy(current_ping=ping)
+                self._bad_ping_streak = 0
+                self._find_better_proxy(current_ping=ping)
         else:
             if self._bad_ping_streak > 0: self.log("Пинг вернулся в норму")
-            self._bad_ping_streak = 0; self._save_status()
+            self._bad_ping_streak = 0
+            self._save_status()
+
+        # DNS prefetch следующих прокси в фоне
+        next_proxies = [
+            self.proxy_list[(self.current_index + i) % len(self.proxy_list)]
+            for i in range(1, PRECONNECT_COUNT + 1)
+            if len(self.proxy_list) > 1
+        ]
+        if next_proxies:
+            threading.Thread(
+                target=self._dns_cache.prefetch,
+                args=(next_proxies,), daemon=True, name="pm-dns-prefetch"
+            ).start()
 
     def _start_monitor(self):
         if self._monitor_running: return

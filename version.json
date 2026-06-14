@@ -1,5 +1,5 @@
 {
-  "version": "6.3.0",
+  "version": "6.4.0",
   "url": "https://raw.githubusercontent.com/MishaPitolin/proxy_manager_plugin/main/proxy_manager.plugin",
-  "changelog": "v6.3.0: фикс автообновления — плагин теперь реально перезагружается через PythonPluginsEngine"
+  "changelog": "v6.4.0: parallel connect race, sticky sessions, exponential backoff, jitter detection, channel scoring, DNS prefetch, IP dedup"
 }
