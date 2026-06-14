@@ -102,7 +102,6 @@ JITTER_WINDOW       = 5      # измерений для подсчёта jitter
 JITTER_THRESHOLD_MS = 150    # если стд.откл. пинга > этого — прокси нестабилен
 BACKOFF_BASE_SECS   = 60     # базовая задержка повторной попытки (экспоненциальный рост)
 BACKOFF_MAX_SECS    = 1800   # максимальная задержка (30 мин)
-CHANNEL_SCORE_FILE  = f"{DATA_DIR}/pm_channel_scores.json"
 DEDUP_IP_RESOLVE    = True   # дедупликация по IP через DoH
 
 # Orbot (Tor) — резервный вариант если всё остальное мертво
@@ -143,7 +142,8 @@ _GOOD_FRONTS = (
 
 DATA_DIR   = "/data/data/com.radolyn.ayugram/files"
 CACHE_FILE = f"{DATA_DIR}/pm_cache.json"
-LOG_FILE   = f"{DATA_DIR}/pm_logs.txt"
+LOG_FILE          = f"{DATA_DIR}/pm_logs.txt"
+CHANNEL_SCORE_FILE = f"{DATA_DIR}/pm_channel_scores.json"
 
 try:
     _LANG = "ru" if str(Locale.getDefault().getLanguage()).lower().startswith("ru") else "en"
@@ -733,175 +733,6 @@ def _hide_status_notification():
 
 
 # ═══════════════════════════════════════════════════════════════════
-#  EXPONENTIAL BACKOFF BLACKLIST
-# ═══════════════════════════════════════════════════════════════════
-
-class BackoffBlacklist(Blacklist):
-    """Расширенный блэклист с экспоненциальным backoff вместо фиксированного TTL."""
-
-    def __init__(self):
-        super().__init__()
-        self._backoff_count: Dict[str, int] = {}  # сколько раз баним этот прокси
-
-    def strike(self, p):
-        k = self._key(p)
-        with self._lock:
-            self._strikes[k] = self._strikes.get(k, 0) + 1
-            if self._strikes[k] >= BL_STRIKES:
-                count = self._backoff_count.get(k, 0)
-                # Exponential backoff: 60 → 120 → 240 → ... → 1800 сек
-                delay = min(BACKOFF_BASE_SECS * (2 ** count), BACKOFF_MAX_SECS)
-                self._banned[k] = time.time() + delay
-                self._backoff_count[k] = count + 1
-                self._strikes[k] = 0
-                log(f"pm: backoff {k} на {delay:.0f}с (попытка {count+1})")
-
-    def reset(self, p):
-        k = self._key(p)
-        with self._lock:
-            self._strikes.pop(k, None)
-            self._banned.pop(k, None)
-            self._backoff_count.pop(k, None)  # сбрасываем счётчик при успехе
-
-    def clear(self):
-        with self._lock:
-            self._strikes.clear()
-            self._banned.clear()
-            self._backoff_count.clear()
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  JITTER TRACKER — считает нестабильность пинга
-# ═══════════════════════════════════════════════════════════════════
-
-class JitterTracker:
-    """Хранит последние N замеров пинга и считает стандартное отклонение."""
-
-    def __init__(self, window: int = JITTER_WINDOW):
-        self._window = window
-        self._samples: Dict[str, List[float]] = {}
-        self._lock = threading.Lock()
-
-    def _key(self, p: dict) -> str:
-        return f"{p['server']}:{p['port']}"
-
-    def record(self, p: dict, ping: float):
-        if ping >= 9999.0: return
-        k = self._key(p)
-        with self._lock:
-            samples = self._samples.setdefault(k, [])
-            samples.append(ping)
-            if len(samples) > self._window:
-                samples.pop(0)
-
-    def jitter(self, p: dict) -> float:
-        """Возвращает стандартное отклонение пинга (мс). 0 если мало данных."""
-        k = self._key(p)
-        with self._lock:
-            samples = self._samples.get(k, [])
-        if len(samples) < 2: return 0.0
-        mean = sum(samples) / len(samples)
-        variance = sum((x - mean) ** 2 for x in samples) / len(samples)
-        return variance ** 0.5
-
-    def is_unstable(self, p: dict) -> bool:
-        return self.jitter(p) > JITTER_THRESHOLD_MS
-
-    def reset(self, p: dict):
-        k = self._key(p)
-        with self._lock:
-            self._samples.pop(k, None)
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  CHANNEL SCORER — помнит какие каналы дают больше живых прокси
-# ═══════════════════════════════════════════════════════════════════
-
-class ChannelScorer:
-    """Ранжирует каналы по проценту живых прокси."""
-
-    def __init__(self, path: str = CHANNEL_SCORE_FILE):
-        self.path = path
-        self._scores: Dict[str, Dict] = {}
-        self._lock = threading.Lock()
-        self._load()
-
-    def _load(self):
-        try:
-            with open(self.path) as f:
-                self._scores = json.load(f)
-        except: self._scores = {}
-
-    def _save(self):
-        try:
-            with open(self.path, "w") as f:
-                json.dump(self._scores, f)
-        except: pass
-
-    def record(self, channel: str, found: int, alive: int):
-        with self._lock:
-            d = self._scores.setdefault(channel, {"found": 0, "alive": 0, "runs": 0})
-            d["found"] += found
-            d["alive"] += alive
-            d["runs"]  += 1
-        self._save()
-
-    def score(self, channel: str) -> float:
-        """Процент живых прокси от найденных. Новые каналы получают 50 (нейтрально)."""
-        with self._lock:
-            d = self._scores.get(channel, {})
-        found = d.get("found", 0)
-        alive = d.get("alive", 0)
-        return (alive / found * 100) if found > 0 else 50.0
-
-    def sort_channels(self, channels: List[str]) -> List[str]:
-        """Сортирует каналы по убыванию score — лучшие парсим первыми."""
-        return sorted(channels, key=lambda c: self.score(c), reverse=True)
-
-
-# ═══════════════════════════════════════════════════════════════════
-#  DNS CACHE — кэш резолвинга для быстрого переключения
-# ═══════════════════════════════════════════════════════════════════
-
-class DNSCache:
-    """Кэш DoH резолвинга — заранее резолвим домены следующих прокси."""
-
-    def __init__(self, ttl: int = 300):
-        self._cache: Dict[str, tuple] = {}  # host -> (ip, expires)
-        self._lock = threading.Lock()
-        self._ttl = ttl
-
-    def get(self, host: str) -> Optional[str]:
-        with self._lock:
-            entry = self._cache.get(host)
-        if not entry: return None
-        ip, expires = entry
-        if time.time() > expires: return None
-        return ip
-
-    def set(self, host: str, ip: str):
-        with self._lock:
-            self._cache[host] = (ip, time.time() + self._ttl)
-
-    def resolve(self, host: str) -> str:
-        """Резолвит через кэш → DoH → системный DNS."""
-        cached = self.get(host)
-        if cached: return cached
-        ip = resolve_host_doh(host)
-        if ip != host: self.set(host, ip)
-        return ip
-
-    def prefetch(self, proxies: List[Dict]):
-        """Заранее резолвит домены списка прокси в фоне."""
-        def _resolve_one(p):
-            host = p.get("server", "")
-            if host and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", host):
-                self.resolve(host)
-        with ThreadPoolExecutor(max_workers=10) as ex:
-            list(ex.map(_resolve_one, proxies))
-
-
-# ═══════════════════════════════════════════════════════════════════
 #  ORBOT (TOR) — РЕЗЕРВНЫЙ ВАРИАНТ
 # ═══════════════════════════════════════════════════════════════════
 
@@ -1123,21 +954,10 @@ class SwitchHistory:
         return "\n".join(lines)
 
 
-class ProxyCache:
-    def __init__(self, path=CACHE_FILE): self.path = path
-    def save(self, proxies):
-        try:
-            with open(self.path, "w") as f: json.dump({"ts": time.time(), "proxies": proxies}, f)
-        except: pass
-    def load(self, max_age=3600):
-        try:
-            with open(self.path) as f: data = json.load(f)
-            if time.time()-data.get("ts",0) < max_age: return data.get("proxies",[])
-        except: pass
-        return []
-    def clear(self):
-        try: os.remove(self.path)
-        except: pass
+
+        self._rewrite_list(pred, "keep")
+# ═══════════════════════════════════════════════════════════════════
+#  EXPONENTIAL BACKOFF BLACKLIST
 
 class Blacklist:
     def __init__(self):
@@ -1164,6 +984,189 @@ class Blacklist:
     def banned_count(self): return len(self._banned)
     def clear(self):
         with self._lock: self._strikes.clear(); self._banned.clear()
+
+
+# ═══════════════════════════════════════════════════════════════════
+
+class BackoffBlacklist(Blacklist):
+    """Расширенный блэклист с экспоненциальным backoff вместо фиксированного TTL."""
+
+    def __init__(self):
+        super().__init__()
+        self._backoff_count: Dict[str, int] = {}  # сколько раз баним этот прокси
+
+    def strike(self, p):
+        k = self._key(p)
+        with self._lock:
+            self._strikes[k] = self._strikes.get(k, 0) + 1
+            if self._strikes[k] >= BL_STRIKES:
+                count = self._backoff_count.get(k, 0)
+                # Exponential backoff: 60 → 120 → 240 → ... → 1800 сек
+                delay = min(BACKOFF_BASE_SECS * (2 ** count), BACKOFF_MAX_SECS)
+                self._banned[k] = time.time() + delay
+                self._backoff_count[k] = count + 1
+                self._strikes[k] = 0
+                log(f"pm: backoff {k} на {delay:.0f}с (попытка {count+1})")
+
+    def reset(self, p):
+        k = self._key(p)
+        with self._lock:
+            self._strikes.pop(k, None)
+            self._banned.pop(k, None)
+            self._backoff_count.pop(k, None)  # сбрасываем счётчик при успехе
+
+    def clear(self):
+        with self._lock:
+            self._strikes.clear()
+            self._banned.clear()
+            self._backoff_count.clear()
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  JITTER TRACKER — считает нестабильность пинга
+# ═══════════════════════════════════════════════════════════════════
+
+class JitterTracker:
+    """Хранит последние N замеров пинга и считает стандартное отклонение."""
+
+    def __init__(self, window: int = JITTER_WINDOW):
+        self._window = window
+        self._samples: Dict[str, List[float]] = {}
+        self._lock = threading.Lock()
+
+    def _key(self, p: dict) -> str:
+        return f"{p['server']}:{p['port']}"
+
+    def record(self, p: dict, ping: float):
+        if ping >= 9999.0: return
+        k = self._key(p)
+        with self._lock:
+            samples = self._samples.setdefault(k, [])
+            samples.append(ping)
+            if len(samples) > self._window:
+                samples.pop(0)
+
+    def jitter(self, p: dict) -> float:
+        """Возвращает стандартное отклонение пинга (мс). 0 если мало данных."""
+        k = self._key(p)
+        with self._lock:
+            samples = self._samples.get(k, [])
+        if len(samples) < 2: return 0.0
+        mean = sum(samples) / len(samples)
+        variance = sum((x - mean) ** 2 for x in samples) / len(samples)
+        return variance ** 0.5
+
+    def is_unstable(self, p: dict) -> bool:
+        return self.jitter(p) > JITTER_THRESHOLD_MS
+
+    def reset(self, p: dict):
+        k = self._key(p)
+        with self._lock:
+            self._samples.pop(k, None)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  CHANNEL SCORER — помнит какие каналы дают больше живых прокси
+# ═══════════════════════════════════════════════════════════════════
+
+class ChannelScorer:
+    """Ранжирует каналы по проценту живых прокси."""
+
+    def __init__(self, path: str = CHANNEL_SCORE_FILE):
+        self.path = path
+        self._scores: Dict[str, Dict] = {}
+        self._lock = threading.Lock()
+        self._load()
+
+    def _load(self):
+        try:
+            with open(self.path) as f:
+                self._scores = json.load(f)
+        except: self._scores = {}
+
+    def _save(self):
+        try:
+            with open(self.path, "w") as f:
+                json.dump(self._scores, f)
+        except: pass
+
+    def record(self, channel: str, found: int, alive: int):
+        with self._lock:
+            d = self._scores.setdefault(channel, {"found": 0, "alive": 0, "runs": 0})
+            d["found"] += found
+            d["alive"] += alive
+            d["runs"]  += 1
+        self._save()
+
+    def score(self, channel: str) -> float:
+        """Процент живых прокси от найденных. Новые каналы получают 50 (нейтрально)."""
+        with self._lock:
+            d = self._scores.get(channel, {})
+        found = d.get("found", 0)
+        alive = d.get("alive", 0)
+        return (alive / found * 100) if found > 0 else 50.0
+
+    def sort_channels(self, channels: List[str]) -> List[str]:
+        """Сортирует каналы по убыванию score — лучшие парсим первыми."""
+        return sorted(channels, key=lambda c: self.score(c), reverse=True)
+
+
+# ═══════════════════════════════════════════════════════════════════
+#  DNS CACHE — кэш резолвинга для быстрого переключения
+# ═══════════════════════════════════════════════════════════════════
+
+class DNSCache:
+    """Кэш DoH резолвинга — заранее резолвим домены следующих прокси."""
+
+    def __init__(self, ttl: int = 300):
+        self._cache: Dict[str, tuple] = {}  # host -> (ip, expires)
+        self._lock = threading.Lock()
+        self._ttl = ttl
+
+    def get(self, host: str) -> Optional[str]:
+        with self._lock:
+            entry = self._cache.get(host)
+        if not entry: return None
+        ip, expires = entry
+        if time.time() > expires: return None
+        return ip
+
+    def set(self, host: str, ip: str):
+        with self._lock:
+            self._cache[host] = (ip, time.time() + self._ttl)
+
+    def resolve(self, host: str) -> str:
+        """Резолвит через кэш → DoH → системный DNS."""
+        cached = self.get(host)
+        if cached: return cached
+        ip = resolve_host_doh(host)
+        if ip != host: self.set(host, ip)
+        return ip
+
+    def prefetch(self, proxies: List[Dict]):
+        """Заранее резолвит домены списка прокси в фоне."""
+        def _resolve_one(p):
+            host = p.get("server", "")
+            if host and not re.match(r"^\d{1,3}(\.\d{1,3}){3}$", host):
+                self.resolve(host)
+        with ThreadPoolExecutor(max_workers=10) as ex:
+            list(ex.map(_resolve_one, proxies))
+
+class ProxyCache:
+    def __init__(self, path=CACHE_FILE): self.path = path
+    def save(self, proxies):
+        try:
+            with open(self.path, "w") as f: json.dump({"ts": time.time(), "proxies": proxies}, f)
+        except: pass
+    def load(self, max_age=3600):
+        try:
+            with open(self.path) as f: data = json.load(f)
+            if time.time()-data.get("ts",0) < max_age: return data.get("proxies",[])
+        except: pass
+        return []
+    def clear(self):
+        try: os.remove(self.path)
+        except: pass
 
 class Prefetcher:
     def __init__(self, get_list, get_idx, n=PREFETCH_COUNT):
